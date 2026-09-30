@@ -3,6 +3,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using HomeNetworkMonitor.Core.Interfaces;
 using HomeNetworkMonitor.Core.Models;
+using HomeNetworkMonitor.Network.Monitoring;
 
 namespace HomeNetworkMonitor.Network.Discovery;
 
@@ -13,7 +14,8 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
     private readonly MacVendorResolver _macVendorResolver;
     private readonly DeviceTypeDetector _deviceTypeDetector;
     private readonly PortScanner _portScanner;
-    
+    private readonly DnsResolver _dnsResolver;
+
     public NetworkDiscoveryService()
     {
         _arpTableReader = new ArpTableReader();
@@ -21,16 +23,29 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
         _macVendorResolver = new MacVendorResolver();
         _deviceTypeDetector = new DeviceTypeDetector();
         _portScanner = new PortScanner();
+        _dnsResolver = new DnsResolver();
     }
 
-    public async Task<IReadOnlyList<NetworkDevice>> DiscoverAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<NetworkDevice>> DiscoverAsync(
+        CancellationToken cancellationToken = default)
     {
         var network = GetLocalNetwork();
 
-        Console.WriteLine($"Interface : {network.InterfaceName}");
-        Console.WriteLine($"Local IP  : {network.LocalAddress}");
+        Console.WriteLine(
+            $"Interface : {network.InterfaceName}");
+
+        Console.WriteLine(
+            $"Local IP  : {network.LocalAddress}");
+
         Console.WriteLine(
             $"Subnet    : {network.NetworkAddress}/{network.PrefixLength}");
+
+        var dnsServers =
+            _dnsResolver.GetDnsServers();
+
+        Console.WriteLine(
+            $"DNS Server: {FormatDnsServers(dnsServers)}");
+
         Console.WriteLine();
 
         var addresses = EnumerateHosts(
@@ -40,9 +55,6 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
         /*
          * Step 1:
          * Probe every host using ICMP.
-         *
-         * Even when a device doesn't answer ping,
-         * the network stack may still attempt ARP resolution.
          */
         var tasks = addresses.Select(
             ip => ProbeAsync(
@@ -50,14 +62,16 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
                 network.InterfaceName,
                 cancellationToken));
 
-        var pingResults = await Task.WhenAll(tasks);
+        var pingResults =
+            await Task.WhenAll(tasks);
 
         /*
          * Step 2:
          * Read the ARP table after the scan.
          */
-        var arpTable = await _arpTableReader.ReadAsync(
-            cancellationToken);
+        var arpTable =
+            await _arpTableReader.ReadAsync(
+                cancellationToken);
 
         /*
          * Step 3:
@@ -90,34 +104,33 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
                     IpAddress = result.IpAddress,
                     MacAddress = macAddress,
                     HostName = null,
+                    DnsHostName = null,
                     PingSucceeded = true,
                     Latency = result.Latency,
                     InterfaceName = network.InterfaceName,
                     DiscoverySource = source,
                     DiscoveredAt = result.DiscoveredAt,
-                    Vendor = _macVendorResolver.Resolve(macAddress)
+                    Vendor =
+                        _macVendorResolver.Resolve(
+                            macAddress)
                 };
-        
-        
         }
 
         /*
          * Step 4:
          * Add ARP entries that were not found by ICMP.
-         *
-         * These are particularly interesting because they may
-         * represent devices that do not respond to ping.
          */
         foreach (var arpEntry in arpTable)
         {
             var ip = arpEntry.Key;
             var mac = arpEntry.Value;
 
-            var arpAddress = IPAddress.Parse(ip);
+            var arpAddress =
+                IPAddress.Parse(ip);
 
             /*
-             * Only include addresses belonging to our
-             * current local network.
+             * Only include addresses belonging
+             * to our current local network.
              */
             if (!IsAddressInNetwork(
                     arpAddress,
@@ -143,79 +156,164 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
                 {
                     IpAddress = ip,
                     MacAddress = mac,
-                    Vendor = _macVendorResolver.Resolve(mac),
+                    Vendor =
+                        _macVendorResolver.Resolve(mac),
                     HostName = null,
+                    DnsHostName = null,
                     PingSucceeded = false,
                     Latency = null,
                     InterfaceName = network.InterfaceName,
                     DiscoverySource = "ARP",
-                    DiscoveredAt = DateTimeOffset.UtcNow
+                    DiscoveredAt =
+                        DateTimeOffset.UtcNow
                 };
         }
 
-        var discoveredDevices = devices.Values
-        .OrderBy(device => GetIpValue(device.IpAddress))
-        .ToList();
+        var discoveredDevices =
+            devices.Values
+                .OrderBy(
+                    device =>
+                        GetIpValue(
+                            device.IpAddress))
+                .ToList();
 
-        var hostnameTasks = discoveredDevices.Select(
-            async device =>
-            {
-                var hostname =
-                    await _hostnameResolver.ResolveAsync(
-                        device.IpAddress,
-                        cancellationToken);
-
-                var openPorts =
-                    await _portScanner.ScanAsync(
-                        device.IpAddress,
-                        cancellationToken);
-
-                var deviceWithFingerprint = new NetworkDevice
+        /*
+         * Step 8:
+         * Hostname resolution.
+         *
+         * Step 15:
+         * Reverse DNS resolution.
+         *
+         * Port scanning and device classification
+         * remain part of the existing discovery pipeline.
+         */
+        var deviceTasks =
+            discoveredDevices.Select(
+                async device =>
                 {
-                    IpAddress = device.IpAddress,
-                    MacAddress = device.MacAddress,
-                    Vendor = device.Vendor,
-                    HostName = hostname,
-                    PingSucceeded = device.PingSucceeded,
-                    Latency = device.Latency,
-                    InterfaceName = device.InterfaceName,
-                    DiscoverySource = device.DiscoverySource,
-                    DiscoveredAt = device.DiscoveredAt,
-                    OpenPorts = openPorts
-                };
+                    var hostname =
+                        await _hostnameResolver.ResolveAsync(
+                            device.IpAddress,
+                            cancellationToken);
 
-                var deviceType =
-                    _deviceTypeDetector.Detect(
-                        deviceWithFingerprint);
+                    var dnsHostname =
+                        await _dnsResolver.ReverseResolveAsync(
+                            device.IpAddress,
+                            cancellationToken);
 
-                return new NetworkDevice
-                {
-                    IpAddress = deviceWithFingerprint.IpAddress,
-                    MacAddress = deviceWithFingerprint.MacAddress,
-                    Vendor = deviceWithFingerprint.Vendor,
-                    HostName = deviceWithFingerprint.HostName,
-                    DeviceType = deviceType,
-                    PingSucceeded = deviceWithFingerprint.PingSucceeded,
-                    Latency = deviceWithFingerprint.Latency,
-                    InterfaceName = deviceWithFingerprint.InterfaceName,
-                    DiscoverySource = deviceWithFingerprint.DiscoverySource,
-                    DiscoveredAt = deviceWithFingerprint.DiscoveredAt,
-                    OpenPorts = deviceWithFingerprint.OpenPorts
-                };
-            });
-            
-        return await Task.WhenAll(hostnameTasks);
+                    var openPorts =
+                        await _portScanner.ScanAsync(
+                            device.IpAddress,
+                            cancellationToken);
+
+                    var deviceWithFingerprint =
+                        new NetworkDevice
+                        {
+                            IpAddress =
+                                device.IpAddress,
+
+                            MacAddress =
+                                device.MacAddress,
+
+                            Vendor =
+                                device.Vendor,
+
+                            HostName =
+                                hostname,
+
+                            DnsHostName =
+                                dnsHostname,
+
+                            PingSucceeded =
+                                device.PingSucceeded,
+
+                            Latency =
+                                device.Latency,
+
+                            InterfaceName =
+                                device.InterfaceName,
+
+                            DiscoverySource =
+                                device.DiscoverySource,
+
+                            DiscoveredAt =
+                                device.DiscoveredAt,
+
+                            OpenPorts =
+                                openPorts
+                        };
+
+                    var deviceType =
+                        _deviceTypeDetector.Detect(
+                            deviceWithFingerprint);
+
+                    return new NetworkDevice
+                    {
+                        IpAddress =
+                            deviceWithFingerprint.IpAddress,
+
+                        MacAddress =
+                            deviceWithFingerprint.MacAddress,
+
+                        Vendor =
+                            deviceWithFingerprint.Vendor,
+
+                        HostName =
+                            deviceWithFingerprint.HostName,
+
+                        DnsHostName =
+                            deviceWithFingerprint.DnsHostName,
+
+                        DeviceType =
+                            deviceType,
+
+                        PingSucceeded =
+                            deviceWithFingerprint.PingSucceeded,
+
+                        Latency =
+                            deviceWithFingerprint.Latency,
+
+                        InterfaceName =
+                            deviceWithFingerprint.InterfaceName,
+
+                        DiscoverySource =
+                            deviceWithFingerprint.DiscoverySource,
+
+                        DiscoveredAt =
+                            deviceWithFingerprint.DiscoveredAt,
+
+                        OpenPorts =
+                            deviceWithFingerprint.OpenPorts
+                    };
+                });
+
+        return await Task.WhenAll(deviceTasks);
     }
 
-    private static async Task<NetworkDevice?> ProbeAsync(IPAddress address, string interfaceName, CancellationToken cancellationToken)
+    private static string FormatDnsServers(
+        IReadOnlyList<string> dnsServers)
+    {
+        if (dnsServers.Count == 0)
+            return "None detected";
+
+        return string.Join(
+            ", ",
+            dnsServers);
+    }
+
+    private static async Task<NetworkDevice?> ProbeAsync(
+        IPAddress address,
+        string interfaceName,
+        CancellationToken cancellationToken)
     {
         using var ping = new Ping();
 
         try
         {
-            var reply = await ping.SendPingAsync(
-                address,
-                500);
+            var reply =
+                await ping.SendPingAsync(
+                    address,
+                    500);
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -224,15 +322,28 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
 
             return new NetworkDevice
             {
-                IpAddress = address.ToString(),
+                IpAddress =
+                    address.ToString(),
+
                 MacAddress = null,
+
                 HostName = null,
+
+                DnsHostName = null,
+
                 PingSucceeded = true,
-                Latency = TimeSpan.FromMilliseconds(
-                    reply.RoundtripTime),
-                InterfaceName = interfaceName,
+
+                Latency =
+                    TimeSpan.FromMilliseconds(
+                        reply.RoundtripTime),
+
+                InterfaceName =
+                    interfaceName,
+
                 DiscoverySource = "ICMP",
-                DiscoveredAt = DateTimeOffset.UtcNow
+
+                DiscoveredAt =
+                    DateTimeOffset.UtcNow
             };
         }
         catch (PingException)
@@ -269,18 +380,22 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
             var properties =
                 networkInterface.GetIPProperties();
 
-            var ipv4 = properties.UnicastAddresses
-                .FirstOrDefault(
-                    address =>
-                        address.Address.AddressFamily ==
-                        AddressFamily.InterNetwork &&
-                        address.IPv4Mask is not null);
+            var ipv4 =
+                properties.UnicastAddresses
+                    .FirstOrDefault(
+                        address =>
+                            address.Address.AddressFamily ==
+                            AddressFamily.InterNetwork &&
+                            address.IPv4Mask is not null);
 
             if (ipv4 is null)
                 continue;
 
-            var localAddress = ipv4.Address;
-            var mask = ipv4.IPv4Mask;
+            var localAddress =
+                ipv4.Address;
+
+            var mask =
+                ipv4.IPv4Mask;
 
             var networkAddress =
                 GetNetworkAddress(
@@ -301,7 +416,9 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
             "No active IPv4 network interface was found.");
     }
 
-    private static IPAddress GetNetworkAddress(IPAddress address, IPAddress mask)
+    private static IPAddress GetNetworkAddress(
+        IPAddress address,
+        IPAddress mask)
     {
         var addressBytes =
             address.GetAddressBytes();
@@ -315,25 +432,33 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
         for (var i = 0; i < 4; i++)
         {
             networkBytes[i] =
-                (byte)(addressBytes[i] &
-                       maskBytes[i]);
+                (byte)(
+                    addressBytes[i] &
+                    maskBytes[i]);
         }
 
-        return new IPAddress(networkBytes);
+        return new IPAddress(
+            networkBytes);
     }
 
-    private static int GetPrefixLength(IPAddress mask)
+    private static int GetPrefixLength(
+        IPAddress mask)
     {
-        var bytes = mask.GetAddressBytes();
+        var bytes =
+            mask.GetAddressBytes();
 
         return bytes.Sum(
-            b => Convert.ToString(
-                    b,
-                    2)
-                .Count(c => c == '1'));
+            b =>
+                Convert.ToString(
+                        b,
+                        2)
+                    .Count(
+                        c => c == '1'));
     }
 
-    private static IEnumerable<IPAddress> EnumerateHosts(IPAddress networkAddress, int prefixLength)
+    private static IEnumerable<IPAddress> EnumerateHosts(
+        IPAddress networkAddress,
+        int prefixLength)
     {
         var networkBytes =
             networkAddress.GetAddressBytes();
@@ -381,7 +506,10 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
         }
     }
 
-    private static bool IsAddressInNetwork(IPAddress address, IPAddress networkAddress, int prefixLength)
+    private static bool IsAddressInNetwork(
+        IPAddress address,
+        IPAddress networkAddress,
+        int prefixLength)
     {
         var addressBytes =
             address.GetAddressBytes();
@@ -395,10 +523,15 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
         var remainingBits =
             prefixLength % 8;
 
-        for (var i = 0; i < fullBytes; i++)
+        for (var i = 0;
+             i < fullBytes;
+             i++)
         {
-            if (addressBytes[i] != networkBytes[i])
+            if (addressBytes[i] !=
+                networkBytes[i])
+            {
                 return false;
+            }
         }
 
         if (remainingBits == 0)
@@ -412,7 +545,10 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
             (networkBytes[fullBytes] & mask);
     }
 
-    private static bool IsNetworkOrBroadcastAddress(IPAddress address, IPAddress networkAddress, int prefixLength)
+    private static bool IsNetworkOrBroadcastAddress(
+        IPAddress address,
+        IPAddress networkAddress,
+        int prefixLength)
     {
         var addressBytes =
             address.GetAddressBytes();
@@ -446,18 +582,23 @@ public sealed class NetworkDiscoveryService : INetworkDiscovery
             addressValue == broadcastValue;
     }
 
-
-    private static uint GetIpValue(string ip)
+    private static uint GetIpValue(
+        string ip)
     {
         var bytes =
             IPAddress.Parse(ip)
                 .GetAddressBytes();
 
-        return ((uint)bytes[0] << 24) |
-               ((uint)bytes[1] << 16) |
-               ((uint)bytes[2] << 8) |
-               bytes[3];
+        return
+            ((uint)bytes[0] << 24) |
+            ((uint)bytes[1] << 16) |
+            ((uint)bytes[2] << 8) |
+            bytes[3];
     }
 
-    private sealed record NetworkInfo(string InterfaceName, IPAddress LocalAddress, IPAddress NetworkAddress, int PrefixLength);
+    private sealed record NetworkInfo(
+        string InterfaceName,
+        IPAddress LocalAddress,
+        IPAddress NetworkAddress,
+        int PrefixLength);
 }
