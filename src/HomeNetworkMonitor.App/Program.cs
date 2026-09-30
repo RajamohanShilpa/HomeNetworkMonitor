@@ -3,12 +3,46 @@ using HomeNetworkMonitor.Core.Models;
 using HomeNetworkMonitor.Network.Controls;
 using HomeNetworkMonitor.Network.Discovery;
 using HomeNetworkMonitor.Network.Monitoring;
+using HomeNetworkMonitor.Network.Persistence;
 
 Console.WriteLine("========================================");
 Console.WriteLine("     Home Network Monitor");
 Console.WriteLine("     Network Discovery");
 Console.WriteLine("========================================");
 Console.WriteLine();
+
+var databaseDirectory =
+    Path.Combine(
+        Directory.GetCurrentDirectory(),
+        "data");
+
+Directory.CreateDirectory(
+    databaseDirectory);
+
+var databasePath =
+    Path.Combine(
+        databaseDirectory,
+        "HomeNetworkMonitor.db");
+
+var connectionFactory =
+    new SQLiteConnectionFactory(
+        databasePath);
+
+var databaseInitializer =
+    new DatabaseInitializer(
+        connectionFactory);
+
+await databaseInitializer.InitializeAsync();
+
+var repository =
+    new NetworkRepository(
+        connectionFactory);
+
+Console.WriteLine(
+    $"Database : {databasePath}");
+
+Console.WriteLine();
+
 
 INetworkDiscovery discovery =
     new NetworkDiscoveryService();
@@ -31,7 +65,7 @@ Console.WriteLine("Press Ctrl+C to stop.");
 Console.WriteLine();
 
 var monitor =
-    new NetworkMonitorService(discovery);
+    new NetworkMonitorService(discovery, repository);
 
 using var cancellationTokenSource =
     new CancellationTokenSource();

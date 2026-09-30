@@ -1,5 +1,6 @@
 using HomeNetworkMonitor.Core.Interfaces;
 using HomeNetworkMonitor.Core.Models;
+using HomeNetworkMonitor.Network.Persistence;
 
 namespace HomeNetworkMonitor.Network.Monitoring;
 
@@ -12,10 +13,14 @@ public sealed class NetworkMonitorService
 
     private readonly NetworkTrafficCollector _trafficCollector;
 
+    private readonly NetworkRepository _repository;
+
     public NetworkMonitorService(
-        INetworkDiscovery discovery)
+        INetworkDiscovery discovery,
+        NetworkRepository repository)
     {
         _discovery = discovery;
+        _repository = repository;
         _trafficCollector = new NetworkTrafficCollector();
     }
 
@@ -41,6 +46,10 @@ public sealed class NetworkMonitorService
 
             UpdateDeviceState(discoveredDevices);
 
+            await PersistDevicesAsync(
+                discoveredDevices,
+                cancellationToken);
+
             PrintCurrentState();
 
             var interfaceName =
@@ -58,6 +67,10 @@ public sealed class NetworkMonitorService
                 if (traffic is not null)
                 {
                     PrintTrafficStatistics(traffic);
+
+                    await _repository.SaveTrafficStatisticsAsync(
+                        traffic,
+                        cancellationToken);
                 }
             }
 
@@ -253,6 +266,32 @@ public sealed class NetworkMonitorService
         double bytesPerSecond)
     {
         return $"{FormatBytes((long)bytesPerSecond)}/s";
+    }
+
+    private async Task PersistDevicesAsync(
+        IReadOnlyList<NetworkDevice> discoveredDevices,
+        CancellationToken cancellationToken)
+    {
+        foreach (var discoveredDevice in discoveredDevices)
+        {
+            var identity =
+                GetDeviceIdentity(discoveredDevice);
+
+            if (!_devices.TryGetValue(
+                    identity,
+                    out var state))
+            {
+                continue;
+            }
+
+            await _repository.UpsertDeviceAsync(
+                identity,
+                discoveredDevice,
+                state.FirstSeen,
+                state.LastSeen,
+                state.IsOnline,
+                cancellationToken);
+        }
     }
 
 }
