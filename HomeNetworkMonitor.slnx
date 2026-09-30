@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/HomeNetworkMonitor.App/HomeNetworkMonitor.App.csproj" />
+    <Project Path="src/HomeNetworkMonitor.Core/HomeNetworkMonitor.Core.csproj" />
+    <Project Path="src/HomeNetworkMonitor.Network/HomeNetworkMonitor.Network.csproj" />
+  </Folder>
+</Solution>
